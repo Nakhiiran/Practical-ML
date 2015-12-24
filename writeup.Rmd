@@ -1,0 +1,169 @@
+## Problem Statement
+
+In this investigation, we used data recorded from four types of body sensors during body building exercises to predict or **classify** new exercises using a subset of predictors from this data, i.e. to predict the `classe` variable. After applying various data cleanup and preprossesing techniques, a training model was built to predict 20 observations from a test dataset. In this document you will find the methods and results we obtained from this investigation.
+
+
+## Methodology
+
+
+### Script preparation
+
+To solve our problem we use the [caret](http://caret.r-forge.r-project.org/) package which provides a common application programming interface (API) to common machine learning algorithms.
+
+```{r, message=FALSE}
+library(caret)
+library(ggplot2)
+library(Hmisc)
+set.seed(12345)
+```
+
+### Loading raw data
+
+The original researchers provided two data sets, one for [training](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and a second one for [testing](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv). We downloaded the data sets and loaded the files using the `read.csv` function built into **R**.
+
+```{r}
+raw_training_data <- read.csv("data//pml-training.csv")
+raw_validation_data <- read.csv("data//pml-testing.csv")
+```
+
+The `raw_training_data` dataset contains `r dim(raw_training_data)[1]` records and `r dim(raw_training_data)[2]` variables (columns). The `raw_validation_data` dataset is comprised of just `r dim(raw_validation_data)[1]` records and the same amount of variables as the training data set (`r dim(raw_validation_data)[2]`).
+
+### Data Cleanup
+
+Before generating a training fitness function or model to be able to classify the human motions using these sensors I decided to inspect the raw datasets to determine which variables were *useful* to general such model and which were not. 
+
+I started by peforming a quick inspection of the datasets by generating a summary report using `summary(raw_training_data)`. This report revealed that many variables has *division by zero* errors (`#DIV/0!`), tables with mostly `NA` values, and other strange output such as the following:
+
+```{r}
+##  kurtosis_picth_forearm kurtosis_yaw_forearm skewness_roll_forearm
+##         :19216                 :19216               :19216        
+##  #DIV/0!:   85          #DIV/0!:  406        #DIV/0!:   83        
+##  -0.0073:    1                               -0.1912:    2        
+##  -0.0442:    1                               -0.4126:    2        
+##  -0.0489:    1                               -0.0004:    1        
+##  -0.0523:    1                               -0.0013:    1        
+##  (Other):  317                               (Other):  317 
+```
+
+This lead me to inspect manually `raw_training_data` and found out that these variables were mostly blanks. Then I investigated the meaning of these variables within the dataset and 
+according to the original researcher's [paper](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201) (Section 5.1) these variables were *covariates* or features derived from the raw sensor data that was recorded during the experiments. The variables represented the *mean, variance, standard deviation, max, min, amplitude, kurtosis, and skewness* for the Euler angles of each of the sensors: *arm-band*, *dumbbell*, *glove*, and *belt*. As covariates, these data was already represented by the *raw* sensor recordings so it was safe to drop them from the dataset. Furthermore, the problem that I wanted to solve in this investigation was to be able to classify a human activity or movement **instantaneously**. If we rely on the summary statistics of the raw readings, then we might not account for the variance in such readings in favor of less bias.
+
+I proceeded to drop those variables from the dataset by acquiring all the column names for these summary statistics and getting their column positions in the data set in order to filter them out.
+
+```{r, results=FALSE}
+exclude_cols <- grep("^var|^avg|^max|^min|^std|^amplitude",names(raw_training_data))
+filtered_training <- raw_training_data[-c(exclude_cols)]
+```
+
+This reduced the number of variables to `r dim(filtered_training)[2]` in the training data which we now call `filtered_training`.
+
+Further inspection of the `filtered_training` dataset in light of the information in the researcher's [paper](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201) revealed other variables that could be dropped from the training dataset:
+
+- **ordering of observations**: `X` represents the ordering of the observations in the data. This variable is not useful since this investigation requires the prediction of a `classe` of human activity/movement based on the readings from the sensors and not the order in which the movements were made or who made them (the `user_name` column was also used to sort the observations). Therefore, it was necessary to drop this column from the dataset.
+- **participant name**:  as mentioned above, the dataset was sorted by participant, which are labeled in column `user_name`. This was not useful for this investigation since I am trying to classify the movement of *any* person using the same sensors, and not only those pariticpants. 
+- **time-based variables**: The following columns were present that were related to the timing of the movements `raw_timestamp_part_1`, `raw_timestamp_part_2`, `cvtd_timestamp`, `new_window`, `num_window`. These variables are not useful since the way that the experiments were carried were not free-form, rather the participants were told to perform the movements in a certain way. Thus, the training dataset contains *accurate* classification of the `classe` of movement, but these observations were artificially constructed. Therefore, the timing and sequence of the movements are not relevant for our model to predict the outcome of a single movement. Therefore, it is useful to drop these columns from the dataset.
+
+```{r}
+excluding_vars <- names(filtered_training) %in% c("X","user_name","raw_timestamp_part_1","raw_timestamp_part_2","cvtd_timestamp","new_window","num_window")
+filtered_training  <- filtered_training[!excluding_vars]
+```
+
+After dropping these columns, the resulting dataset had a total of  `r dim(filtered_training)[2]` predictor variables.
+
+### Preprocessing using near-zero variance analysis
+
+The resulting training dataset still contains quite a few variables, thus it would be useful to identify other variables that might not be useful for building our fitness model. Therefore, I decided to perform a zero and near-zero-variance analysis on `filtered_training`. The usefulness of this analysis is that we may identify variables that might break our model by providing a constant value across all observations (records). Here is the output of the analysis:
+
+```{r}
+nearZeroVar(filtered_training,saveMetrics=TRUE)
+```
+
+The `nzv` column in the output above shows `r length(nearZeroVar(filtered_training,saveMetrics=FALSE))[1]` variables who have near-zero variance and thus it is useful to drop them from our training dataset.
+
+```{r}
+nzv_cols <- nearZeroVar(filtered_training,saveMetrics=FALSE)
+filtered_training <- filtered_training[-c(nzv_cols)]
+```
+
+After dropping the near-zero variance columns, the resulting training dataset `filtered_training` now contains `r dim(filtered_training)[2]` variables/predictors.
+
+### Preprocessing highly correlated predictors
+
+The `filtered_training` dataset still contains `r dim(filtered_training)[2]` variables/predictors, which is still not a manageable amount to perform exploratory data analysis. If there was a possibility to trim the dataset even more it would make our training process more scalable. I decided to perform a correlation analysis between the `r dim(filtered_training)[2] - 1` predictors of `filtered_training` (the `classe` column which is our outcome was omitted). I approached this by generating a *scatter plot matrix* visualization to investigate if there were predictors that were correlated, but the rendering was slow. As an alternative, I decided to perform a correlation analysis using `findCorrelation` function. To accomplish this I needed to build a correlation matrix based on the `filtered_training` dataset, and that required the filtering of categorical/factor variables from the dataset as well. A quick in
+
+```{r}
+
+filtered_training_no_class <- filtered_training[-c(dim(filtered_training))]
+correlated_cols_to_exclude <- findCorrelation(cor(filtered_training_no_class), cutoff= 0.75)
+filtered_training <- filtered_training[-c(correlated_cols_to_exclude)]
+```
+
+The `findCorrelation` function returns a list of suggested variables to exclude from the dataset since they were found to be highly correlated (with cutoff of R-square of 0.75). The list of the positions of those columns is stored in `correlated_cols_to_exclude` and later used to filter them out from the `filtered_training` dataset. The resulting dataset contains a total of `r dim(filtered_training)[2]` variables/predictors. The resulting dataset represents a more manegeable dataset to be used as part of the training process. The following are the final predictors that we will use to build our fitness model:
+
+
+```{r, echo=FALSE}
+resulting_predictors <- names(filtered_training)
+for (i in 1:length(resulting_predictors)){
+  print(resulting_predictors[i])
+}
+```
+
+### Preprocess Testing Dataset
+In order to ensure that the predictions follow the training model that I will generate later on, I processed the testing dataset (`raw_validation_data`) using the same process used for the training data, i.e. `raw_training_data`.
+
+### Build training fitness model
+
+In order to be able to test our model, we partitioned the `filtered_training` dataset into a `training` and `probe` datasets. We used a simple partitioning mechanism using sampling without substitution, generating a training dataset that had 75% of the observations (`r dim(training)[1]` observations) of the `filtered_training` dataset. The `probe` dataset has 25% of the `filtered_training` dataset observations (`r dim(probe)[1]` observations).
+
+```{r}
+filtered_partition = createDataPartition(filtered_training$classe, p=0.75, list=F)
+training <- filtered_training[filtered_partition,]
+probe <- filtered_training[-filtered_partition,]
+```
+
+I decided to use the `caret` `train` function with the `rf` random forest algorithm since it is one of the top algorithms for classification purposes in machine learning. Also, it **uses cross-validation internally** as per this [documentation]{https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm} and thus, we do not need to use other methods for partitioning our dataset beyond what we used above. Before executing the training process I installed and loaded the [doMC](http://cran.r-project.org/web/packages/doMC/index.html) R package which allows the caret functions to parallelize the execution among the CPU cores of a machine. This was intended to speed up the building of the model.
+
+```
+classeFit <- train(training$classe ~., data=training, method="rf",prox=TRUE)
+```
+
+The following is the confusion matrix of the fitness model that was generated. As it can be seen the misclassification error or in-sample error was very low (`r 100*(14+16+10+41+4+1+11+5+1+6)/dim(training)[1]`%) when applied to the training data itself.
+
+```{r, echo=FALSE}
+load("classeFitRfNoCVMinusX.RData")
+```
+
+```
+classeFit$finalModel
+        OOB estimate of  error rate: 0.74%
+Confusion matrix:
+     A    B    C    D    E  class.error
+A 4183    0    0    1    1 0.0004778973
+B   14 2824   10    0    0 0.0084269663
+C    0   16 2540   11    0 0.0105181145
+D    0    0   41 2365    6 0.0194859038
+E    0    0    4    5 2697 0.0033259424
+```
+
+### Testing fitness model
+
+I tested the fitness model function `classeFit` on the `probe` dataset as such:
+
+```{r, message=FALSE}
+pred <- predict(classeFit,probe)
+```
+
+Then, I generated the confusion matrix for that prediction to evaluate the misclassification or out-of-sample error as such:
+
+```{r}
+probe$predRight <- pred == probe$classe
+table(pred,probe$classe)
+```
+
+
+As it can be seen, the fitness model only misclassified 7 out of `r dim(probe)[1]` **(`r 100*(7)/dim(probe)[1]`%)** observations in this prediction test on the `probe` dataset.
+
+# Results
+
+After applying the fitness model function to the testing dataset `pml-testing.csv` (after filtering and preprocessing) the following predictions were obtained for the 20 test cases:
+`B A B A A E D B A A B C B A E E A B B B`.
